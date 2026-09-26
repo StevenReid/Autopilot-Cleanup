@@ -577,8 +577,8 @@
     <!-- Hero Section -->
     <section class="hero">
         <h1 class="hero-brand">[ A U T O P I L O T &nbsp; C L E A N U P ]</h1>
-        <p class="hero-tagline">Bulk device cleanup across Autopilot, Intune, and Entra ID.</p>
-        <p class="hero-sub">Remove devices from all three services in one workflow &mdash; with PowerShell.</p>
+        <p class="hero-tagline">Device cleanup across Autopilot, Intune, Entra ID, and Defender.</p>
+        <p class="hero-sub">Dispose of devices, or wipe a leaver's device and return it to stock &mdash; with PowerShell.</p>
         <div class="hero-buttons">
             <a href="#quickstart" class="btn btn-primary">Install Now</a>
             <a href="https://github.com/markorr321/Autopilot-Cleanup" class="btn btn-secondary">
@@ -600,14 +600,29 @@
                 <p>Remove devices from Autopilot, Intune, and Entra ID in the correct dependency order &mdash; all in a single workflow.</p>
             </div>
             <div class="feature-card">
+                <div class="feature-icon">&#x267B;</div>
+                <h3>Leaver: Return to Stock</h3>
+                <p>Wipe a leaver's device and keep it in Autopilot for the next user &mdash; assigned user removed, group tag set to Stock, Entra device kept.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F6E1;</div>
+                <h3>Defender Tagging</h3>
+                <p>Tags each device's Defender for Endpoint record as Disposed or Stock, so it can be filtered out of reports straight away.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">&#x1F195;</div>
+                <h3>Device Preparation Support</h3>
+                <p>Windows devices in Intune with no Autopilot record (Autopilot device preparation) are included alongside Autopilot devices.</p>
+            </div>
+            <div class="feature-card">
                 <div class="feature-icon">&#x1F5B1;</div>
                 <h3>Interactive Device Selection</h3>
-                <p>WPF grid view with search, multi-select, and GroupTag filtering. Pick exactly the devices you want to remove.</p>
+                <p>WPF grid with checkboxes, search, and sortable columns &mdash; including Entra last activity, owner, and Autopilot assigned user.</p>
             </div>
             <div class="feature-card">
                 <div class="feature-icon">&#x26A1;</div>
-                <h3>Fast Bulk Removal</h3>
-                <p>Bulk removal mode skips status checking for speed, then exports results to a CSV for review.</p>
+                <h3>Fast Mode &amp; CSV Report</h3>
+                <p>Fast mode skips status checks for speed. Every run exports a CSV with per-service status and elapsed time.</p>
             </div>
             <div class="feature-card">
                 <div class="feature-icon">&#x1F50D;</div>
@@ -683,7 +698,7 @@
     <!-- How It Works -->
     <section>
         <h2 class="section-title">How It Works</h2>
-        <p class="section-subtitle">Devices are removed in the correct dependency order.</p>
+        <p class="section-subtitle">Disposal removes devices in the correct dependency order. Leaver wipes the device and keeps its Autopilot record for reuse.</p>
         <div class="steps-grid">
             <div class="step-card">
                 <div class="step-number">1</div>
@@ -692,8 +707,8 @@
             </div>
             <div class="step-card">
                 <div class="step-number">2</div>
-                <h3>Select Devices</h3>
-                <p>Interactive WPF grid displays all Autopilot devices enriched with Intune &amp; Entra data.</p>
+                <h3>Select Devices &amp; Action</h3>
+                <p>Pick devices in the WPF grid (Autopilot devices plus Intune-only Windows devices), then choose Disposal or Leaver. Defender records are tagged first.</p>
             </div>
             <div class="step-card">
                 <div class="step-number">3</div>
@@ -712,8 +727,8 @@
             </div>
             <div class="step-card">
                 <div class="step-number">6</div>
-                <h3>Verify</h3>
-                <p>Monitors and confirms successful removal from all three services.</p>
+                <h3>Verify &amp; Report</h3>
+                <p>Monitors and confirms the result, then writes a CSV report with status and elapsed time per service.</p>
             </div>
         </div>
     </section>
@@ -745,8 +760,15 @@
             <div class="code-step">
                 <div class="code-label">Optional: Target by Serial Number</div>
                 <div class="code-block">
-                    <span class="comment"># Remove a single device directly</span><br>
+                    <span class="comment"># Target a single device directly, e.g. a leaver's laptop</span><br>
                     <span class="command">Start-AutopilotCleanup</span> -SerialNumber <span class="string">"ABC1234"</span>
+                </div>
+            </div>
+            <div class="code-step">
+                <div class="code-label">Optional: Leaver with Owner Removal</div>
+                <div class="code-block">
+                    <span class="comment"># Choose option 5 or 6 (Leaver) from the menu</span><br>
+                    <span class="command">Start-AutopilotCleanup</span> -SerialNumber <span class="string">"ABC1234"</span> -RemoveEntraOwner
                 </div>
             </div>
             <div class="code-step">
@@ -792,6 +814,31 @@
                     <td><span class="param-type">String[]</span></td>
                     <td>One or more serial numbers to target directly, bypasses the WPF grid</td>
                 </tr>
+                <tr>
+                    <td><span class="param-name">-StockGroupTag</span></td>
+                    <td><span class="param-type">String</span></td>
+                    <td>Autopilot group tag set by the Leaver action (default Stock)</td>
+                </tr>
+                <tr>
+                    <td><span class="param-name">-LeaverDefenderTag</span></td>
+                    <td><span class="param-type">String</span></td>
+                    <td>Defender tag applied by the Leaver action (default Stock)</td>
+                </tr>
+                <tr>
+                    <td><span class="param-name">-DisposalDefenderTag</span></td>
+                    <td><span class="param-type">String</span></td>
+                    <td>Defender tag applied by the Disposal actions (default Disposed)</td>
+                </tr>
+                <tr>
+                    <td><span class="param-name">-SkipDefenderTag</span></td>
+                    <td><span class="param-type">Switch</span></td>
+                    <td>Don't tag devices in Defender for Endpoint</td>
+                </tr>
+                <tr>
+                    <td><span class="param-name">-RemoveEntraOwner</span></td>
+                    <td><span class="param-type">Switch</span></td>
+                    <td>Leaver also removes the Entra device's registered owner (needs Intune Administrator or Windows 365 Administrator)</td>
+                </tr>
             </tbody>
         </table>
     </section>
@@ -799,23 +846,36 @@
     <!-- API Permissions -->
     <section>
         <h2 class="section-title">API Permissions</h2>
-        <p class="section-subtitle">Required Microsoft Graph delegated permissions.</p>
+        <p class="section-subtitle">Delegated permissions. Defender tagging needs a custom app registration.</p>
         <div class="permissions-grid">
             <div class="permission-group">
                 <h3>Default Auth</h3>
                 <ul>
-                    <li>Device.ReadWrite.All</li>
+                    <li>Device.Read.All</li>
+                    <li>Directory.AccessAsUser.All</li>
                     <li>DeviceManagementManagedDevices.ReadWrite.All</li>
+                    <li>DeviceManagementManagedDevices.PrivilegedOperations.All</li>
                     <li>DeviceManagementServiceConfig.ReadWrite.All</li>
+                    <li>User.ReadBasic.All</li>
                 </ul>
             </div>
             <div class="permission-group">
                 <h3>Custom App Registration</h3>
                 <ul>
-                    <li>Device.ReadWrite.All</li>
+                    <li>Device.Read.All</li>
+                    <li>Directory.AccessAsUser.All</li>
                     <li>DeviceManagementManagedDevices.ReadWrite.All</li>
                     <li>DeviceManagementManagedDevices.PrivilegedOperations.All</li>
                     <li>DeviceManagementServiceConfig.ReadWrite.All</li>
+                    <li>User.ReadBasic.All</li>
+                </ul>
+            </div>
+            <div class="permission-group" style="grid-column: 1 / -1;">
+                <h3>Optional &amp; Roles</h3>
+                <ul>
+                    <li>WindowsDefenderATP &rsaquo; Machine.ReadWrite &mdash; Defender tagging (custom app, admin consent, <em>Manage security settings</em> role)</li>
+                    <li>Entra role to delete devices &mdash; Intune Administrator, Cloud Device Administrator, or Windows 365 Administrator</li>
+                    <li>No application permissions &mdash; Device.ReadWrite.All is application-only and isn't used</li>
                 </ul>
             </div>
         </div>

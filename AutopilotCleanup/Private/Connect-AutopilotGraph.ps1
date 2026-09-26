@@ -1,11 +1,16 @@
 ﻿function Connect-AutopilotGraph {
     Write-ColorOutput "Connecting to Microsoft Graph..." "Yellow"
 
+    # Delegated scopes only - Device.ReadWrite.All is application-only.
+    # Deleting an Entra device (and removing its owner) as a signed-in user needs Directory.AccessAsUser.All,
+    # limited by the user's Entra role (Intune Administrator, Cloud Device Administrator or Windows 365 Administrator)
     $requiredScopes = @(
-        "Device.ReadWrite.All",
+        "Device.Read.All",
+        "Directory.AccessAsUser.All",
         "DeviceManagementManagedDevices.ReadWrite.All",
         "DeviceManagementManagedDevices.PrivilegedOperations.All",
-        "DeviceManagementServiceConfig.ReadWrite.All"
+        "DeviceManagementServiceConfig.ReadWrite.All",
+        "User.ReadBasic.All"   # Resolve Entra device owner UPN/display name
     )
 
     try {

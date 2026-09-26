@@ -3,6 +3,10 @@ $script:MonitoringMode = $false
 $script:NoLoggingMode = $false
 $script:CustomClientId = $null
 $script:CustomTenantId = $null
+$script:DefenderToken = $null
+$script:DefenderTokenExpiry = [datetime]::MinValue
+$script:DefenderRefreshToken = $null
+$script:DefenderUnavailable = $false
 
 # Dot-source all private functions
 $privatePath = Join-Path -Path $PSScriptRoot -ChildPath 'Private'

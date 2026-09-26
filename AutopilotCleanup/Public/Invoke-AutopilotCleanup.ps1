@@ -8,7 +8,22 @@
         [string]$TenantId,
 
         [Parameter(HelpMessage = "One or more serial numbers to target for removal. Bypasses the device selection grid.")]
-        [string[]]$SerialNumber
+        [string[]]$SerialNumber,
+
+        [Parameter(HelpMessage = "Autopilot group tag applied to devices returned to stock by the Leaver action")]
+        [string]$StockGroupTag = "Stock",
+
+        [Parameter(HelpMessage = "Defender for Endpoint tag applied by the Leaver action")]
+        [string]$LeaverDefenderTag = "Stock",
+
+        [Parameter(HelpMessage = "Defender for Endpoint tag applied by the Disposal actions")]
+        [string]$DisposalDefenderTag = "Disposed",
+
+        [Parameter(HelpMessage = "Skip tagging devices in Defender for Endpoint")]
+        [switch]$SkipDefenderTag,
+
+        [Parameter(HelpMessage = "Leaver action also removes the Entra device's registered owner")]
+        [switch]$RemoveEntraOwner
     )
 
     # Check for module updates
@@ -20,6 +35,7 @@
     # Initialize module-level variables
     $script:MonitoringMode = $false
     $script:NoLoggingMode = $false
+    $script:DefenderUnavailable = $false
 
     # Resolve custom app registration: params → env vars → default
     if ([string]::IsNullOrWhiteSpace($ClientId)) {
@@ -103,37 +119,45 @@
                 Write-ColorOutput "  Error querying Autopilot for $sn`: $($_.Exception.Message)" "Red"
             }
 
-            if (-not $autopilotDevice) {
-                $notFoundSerials += $sn
-                Write-ColorOutput "  ✗ Not found in Autopilot: $sn" "Yellow"
-                continue
-            }
-
-            # Find in Intune by serial number
+            # Find in Intune by serial number - devices onboarded via Autopilot device preparation have no Autopilot record
             $intuneDevice = $null
             try {
                 $uri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$filter=serialNumber eq '$sn'"
                 $response = Invoke-MgGraphRequest -Uri $uri -Method GET
                 if ($response.value) {
-                    $intuneDevice = $response.value | Select-Object -First 1
+                    # Most recently synced record if the device has enrolled more than once
+                    $intuneDevice = $response.value | Sort-Object { $_.lastSyncDateTime } -Descending | Select-Object -First 1
                 }
-            } catch { }
+            } catch {
+                Write-ColorOutput "  Error querying Intune for $sn`: $($_.Exception.Message)" "Red"
+            }
 
-            # Find in Entra ID by Azure AD Device ID
+            if (-not $autopilotDevice -and -not $intuneDevice) {
+                $notFoundSerials += $sn
+                Write-ColorOutput "  ✗ Not found in Autopilot or Intune: $sn" "Yellow"
+                continue
+            }
+
+            # Find in Entra ID by device ID (from Autopilot, then Intune), falling back to display name
             $entraDevice = $null
-            if ($autopilotDevice.azureActiveDirectoryDeviceId) {
+            $entraLookupId = if ($autopilotDevice.azureActiveDirectoryDeviceId) {
+                $autopilotDevice.azureActiveDirectoryDeviceId
+            } elseif ($intuneDevice.azureADDeviceId -and $intuneDevice.azureADDeviceId -ne '00000000-0000-0000-0000-000000000000') {
+                $intuneDevice.azureADDeviceId
+            }
+            if ($entraLookupId) {
                 try {
-                    $uri = "https://graph.microsoft.com/v1.0/devices?`$filter=deviceId eq '$($autopilotDevice.azureActiveDirectoryDeviceId)'"
+                    $uri = "https://graph.microsoft.com/v1.0/devices?`$filter=deviceId eq '$entraLookupId'&`$expand=registeredOwners"
                     $response = Invoke-MgGraphRequest -Uri $uri -Method GET
                     if ($response.value) {
                         $entraDevice = $response.value | Select-Object -First 1
                     }
                 } catch { }
             }
-            # Fall back to display name
-            if (-not $entraDevice -and $autopilotDevice.displayName) {
+            $entraLookupName = if ($autopilotDevice.displayName) { $autopilotDevice.displayName } else { $intuneDevice.deviceName }
+            if (-not $entraDevice -and $entraLookupName) {
                 try {
-                    $uri = "https://graph.microsoft.com/v1.0/devices?`$filter=displayName eq '$($autopilotDevice.displayName)'"
+                    $uri = "https://graph.microsoft.com/v1.0/devices?`$filter=displayName eq '$entraLookupName'&`$expand=registeredOwners"
                     $response = Invoke-MgGraphRequest -Uri $uri -Method GET
                     if ($response.value) {
                         $entraDevice = $response.value | Select-Object -First 1
@@ -141,44 +165,17 @@
                 } catch { }
             }
 
-            # Build display name
-            $displayName = if ($autopilotDevice.displayName -and $autopilotDevice.displayName -ne "") {
-                $autopilotDevice.displayName
-            } elseif ($intuneDevice -and $intuneDevice.deviceName) {
-                $intuneDevice.deviceName
-            } elseif ($entraDevice -and $entraDevice.displayName) {
-                $entraDevice.displayName
-            } else {
-                "Device-$sn"
-            }
-
-            $enriched = [PSCustomObject]@{
-                AutopilotId = $autopilotDevice.id
-                DisplayName = $displayName
-                SerialNumber = $autopilotDevice.serialNumber
-                Model = $autopilotDevice.model
-                Manufacturer = $autopilotDevice.manufacturer
-                GroupTag = if ($autopilotDevice.groupTag) { $autopilotDevice.groupTag } else { "None" }
-                IntuneFound = if ($intuneDevice) { "Yes" } else { "No" }
-                IntuneId = if ($intuneDevice) { $intuneDevice.id } else { $null }
-                IntuneName = if ($intuneDevice) { $intuneDevice.deviceName } else { "N/A" }
-                EntraFound = if ($entraDevice) { "Yes" } else { "No" }
-                EntraId = if ($entraDevice) { $entraDevice.id } else { $null }
-                EntraDeviceId = if ($entraDevice -and $entraDevice.deviceId) { $entraDevice.deviceId } elseif ($autopilotDevice.azureActiveDirectoryDeviceId) { $autopilotDevice.azureActiveDirectoryDeviceId } else { $null }
-                EntraName = if ($entraDevice) { $entraDevice.displayName } else { "N/A" }
-                _AutopilotDevice = $autopilotDevice
-                _IntuneDevice = $intuneDevice
-                _EntraDevice = $entraDevice
-            }
+            $enriched = New-EnrichedDevice -AutopilotDevice $autopilotDevice -IntuneDevice $intuneDevice -EntraDevice $entraDevice
 
             $enrichedDevices += $enriched
             $selectedDevices += $enriched
-            Write-ColorOutput "  ✓ Found: $displayName ($sn)" "Green"
+            $source = if ($autopilotDevice) { "Autopilot" } else { "Intune only - no Autopilot record" }
+            Write-ColorOutput "  ✓ Found: $($enriched.DisplayName) ($sn) [$source]" "Green"
         }
 
         Write-ColorOutput ""
         if ($notFoundSerials.Count -gt 0) {
-            Write-ColorOutput "$($notFoundSerials.Count) serial number(s) not found in Autopilot" "Yellow"
+            Write-ColorOutput "$($notFoundSerials.Count) serial number(s) not found in Autopilot or Intune" "Yellow"
         }
         Write-ColorOutput "Matched $($selectedDevices.Count) of $($SerialNumber.Count) serial number(s)" "Cyan"
     } else {
@@ -218,7 +215,7 @@
 
             $autopilotJob = Start-ThreadJob -ScriptBlock $fetchScript -ArgumentList "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities", "Autopilot", $progressTracker
             $intuneJob = Start-ThreadJob -ScriptBlock $fetchScript -ArgumentList "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices", "Intune", $progressTracker
-            $entraJob = Start-ThreadJob -ScriptBlock $fetchScript -ArgumentList "https://graph.microsoft.com/v1.0/devices", "Entra ID", $progressTracker
+            $entraJob = Start-ThreadJob -ScriptBlock $fetchScript -ArgumentList "https://graph.microsoft.com/v1.0/devices?`$expand=registeredOwners", "Entra ID", $progressTracker
 
             $allJobs = @(
                 @{ Job = $autopilotJob; Name = "Autopilot"; Id = 1 }
@@ -274,7 +271,7 @@
                 # Sequential fallback
                 $autopilotDevices = Get-GraphPagedResults -Uri "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities" -ActivityName "Fetching Autopilot devices"
                 $allIntuneDevices = Get-GraphPagedResults -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices" -ActivityName "Fetching Intune devices"
-                $allEntraDevices = Get-GraphPagedResults -Uri "https://graph.microsoft.com/v1.0/devices" -ActivityName "Fetching Entra ID devices"
+                $allEntraDevices = Get-GraphPagedResults -Uri "https://graph.microsoft.com/v1.0/devices?`$expand=registeredOwners" -ActivityName "Fetching Entra ID devices"
             } else {
                 $autopilotResult = Receive-Job -Job $autopilotJob -Wait
                 $intuneResult = Receive-Job -Job $intuneJob -Wait
@@ -301,12 +298,12 @@
             Write-ColorOutput "Found $($allIntuneDevices.Count) Intune devices" "Green"
 
             Write-ColorOutput "Fetching all Entra ID devices..." "Yellow"
-            $allEntraDevices = Get-GraphPagedResults -Uri "https://graph.microsoft.com/v1.0/devices" -ActivityName "Fetching Entra ID devices"
+            $allEntraDevices = Get-GraphPagedResults -Uri "https://graph.microsoft.com/v1.0/devices?`$expand=registeredOwners" -ActivityName "Fetching Entra ID devices"
             Write-ColorOutput "Found $($allEntraDevices.Count) Entra ID devices" "Green"
         }
 
-        if ($autopilotDevices.Count -eq 0) {
-            Write-ColorOutput "No Autopilot devices found. Exiting." "Red"
+        if ($autopilotDevices.Count -eq 0 -and $allIntuneDevices.Count -eq 0) {
+            Write-ColorOutput "No Autopilot or Intune devices found. Exiting." "Red"
             return
         }
 
@@ -315,7 +312,13 @@
         $intuneByName = @{}
         foreach ($device in $allIntuneDevices) {
             if ($device.serialNumber) {
-                $intuneBySerial[$device.serialNumber] = $device
+                # Keep the most recently synced record if the device has enrolled more than once
+                $existing = $intuneBySerial[$device.serialNumber]
+                $deviceSync = if ($device.lastSyncDateTime) { [datetime]$device.lastSyncDateTime } else { [datetime]::MinValue }
+                $existingSync = if ($existing.lastSyncDateTime) { [datetime]$existing.lastSyncDateTime } else { [datetime]::MinValue }
+                if (-not $existing -or $deviceSync -gt $existingSync) {
+                    $intuneBySerial[$device.serialNumber] = $device
+                }
             }
             if ($device.deviceName) {
                 $intuneByName[$device.deviceName] = $device
@@ -338,7 +341,8 @@
 
         Write-ColorOutput ""
         Write-ColorOutput "Enriching device information..." "Cyan"
-        $enrichedDevices = foreach ($device in $autopilotDevices) {
+        $matchedIntuneIds = [System.Collections.Generic.HashSet[string]]::new()
+        $autopilotRows = foreach ($device in $autopilotDevices) {
             # Fast local lookup instead of API calls
             $intuneDevice = $null
             if ($device.serialNumber -and $intuneBySerial.ContainsKey($device.serialNumber)) {
@@ -346,6 +350,7 @@
             } elseif ($device.displayName -and $intuneByName.ContainsKey($device.displayName)) {
                 $intuneDevice = $intuneByName[$device.displayName]
             }
+            if ($intuneDevice) { $null = $matchedIntuneIds.Add($intuneDevice.id) }
 
             $entraDevice = $null
             # First try by Azure AD Device ID (most reliable)
@@ -357,45 +362,34 @@
                 $entraDevice = $entraByName[$device.displayName] | Select-Object -First 1
             }
 
-            # Create a meaningful display name
-            $displayName = if ($device.displayName -and $device.displayName -ne "") {
-                $device.displayName
-            } elseif ($intuneDevice -and $intuneDevice.deviceName) {
-                $intuneDevice.deviceName
-            } elseif ($entraDevice -and $entraDevice.displayName) {
-                $entraDevice.displayName
-            } elseif ($device.serialNumber) {
-                "Device-$($device.serialNumber)"
-            } else {
-                "Unknown-$($device.id.Substring(0,8))"
+            New-EnrichedDevice -AutopilotDevice $device -IntuneDevice $intuneDevice -EntraDevice $entraDevice
+        }
+
+        # Windows devices in Intune with no Autopilot record (e.g. onboarded via Autopilot device preparation)
+        # Devices without a serial number are skipped - removal matches devices by serial number
+        $autopilotSerials = [System.Collections.Generic.HashSet[string]]::new([string[]]@($autopilotDevices | Where-Object { $_.serialNumber } | ForEach-Object { $_.serialNumber }))
+        $intuneOnlyRows = foreach ($intuneDevice in $intuneBySerial.Values) {
+            if ($intuneDevice.operatingSystem -ne 'Windows') { continue }
+            if ($autopilotSerials.Contains($intuneDevice.serialNumber) -or $matchedIntuneIds.Contains($intuneDevice.id)) { continue }
+
+            $entraDevice = $null
+            if ($intuneDevice.azureADDeviceId -and $entraByDeviceId.ContainsKey($intuneDevice.azureADDeviceId)) {
+                $entraDevice = $entraByDeviceId[$intuneDevice.azureADDeviceId]
+            } elseif ($intuneDevice.deviceName -and $entraByName.ContainsKey($intuneDevice.deviceName)) {
+                $entraDevice = $entraByName[$intuneDevice.deviceName] | Select-Object -First 1
             }
 
-            [PSCustomObject]@{
-                AutopilotId = $device.id
-                DisplayName = $displayName
-                SerialNumber = $device.serialNumber
-                Model = $device.model
-                Manufacturer = $device.manufacturer
-                GroupTag = if ($device.groupTag) { $device.groupTag } else { "None" }
-                IntuneFound = if ($intuneDevice) { "Yes" } else { "No" }
-                IntuneId = if ($intuneDevice) { $intuneDevice.id } else { $null }
-                IntuneName = if ($intuneDevice) { $intuneDevice.deviceName } else { "N/A" }
-                EntraFound = if ($entraDevice) { "Yes" } else { "No" }
-                EntraId = if ($entraDevice) { $entraDevice.id } else { $null }
-                EntraDeviceId = if ($entraDevice -and $entraDevice.deviceId) { $entraDevice.deviceId } elseif ($device.azureActiveDirectoryDeviceId) { $device.azureActiveDirectoryDeviceId } else { $null }
-                EntraName = if ($entraDevice) { $entraDevice.displayName } else { "N/A" }
-                # Store original objects for deletion
-                _AutopilotDevice = $device
-                _IntuneDevice = $intuneDevice
-                _EntraDevice = $entraDevice
-            }
+            New-EnrichedDevice -IntuneDevice $intuneDevice -EntraDevice $entraDevice
         }
+
+        $enrichedDevices = @($autopilotRows) + @($intuneOnlyRows)
+        Write-ColorOutput "  $(@($autopilotRows).Count) Autopilot device(s), $(@($intuneOnlyRows).Count) Windows device(s) in Intune with no Autopilot record" "Gray"
 
         Write-ColorOutput ""
         Write-ColorOutput "Opening device selection window..." "Cyan"
-        Write-ColorOutput "  Select the devices you want to remove, then click OK." "Gray"
+        Write-ColorOutput "  Select the devices to clean up, then click OK. You choose Disposal or Leaver next." "Gray"
         Write-ColorOutput "  Waiting for selection..." "Gray"
-        $selectedDevices = Show-DeviceSelectionGrid -Devices $enrichedDevices
+        $selectedDevices = Show-DeviceSelectionGrid -Devices $enrichedDevices -Title "Select Devices to Clean Up"
     }
 
     if (-not $selectedDevices -or $selectedDevices.Count -eq 0) {
@@ -551,7 +545,8 @@
         Write-ColorOutput ""
     }
 
-    # Ask user if they want to wipe devices first
+    # Choose the action: Disposal (remove from all services) or Leaver (wipe and return to stock)
+    $actionType = "Disposal"
     $validChoice = $false
     while (-not $validChoice) {
         Write-ColorOutput ""
@@ -560,18 +555,22 @@
         Write-ColorOutput ""
         Write-ColorOutput "What action do you want to perform?" "Cyan"
         Write-ColorOutput ""
+        Write-ColorOutput "  DISPOSAL - remove from Autopilot, Intune and Entra ID" "Magenta"
         Write-ColorOutput "  STANDARD (monitors removal status):" "White"
         Write-ColorOutput "  [1] Remove records only" "White"
         Write-ColorOutput "  [2] WIPE device(s) + remove all records" "Red"
-        Write-ColorOutput ""
-        Write-ColorOutput "  FAST (skips status checks, exports CSV):" "Green"
+        Write-ColorOutput "  FAST (skips status checks):" "Green"
         Write-ColorOutput "  [3] Remove records only" "Green"
         Write-ColorOutput "  [4] WIPE device(s) + remove all records" "Red"
         Write-ColorOutput ""
-        Write-ColorOutput "  [5] Cancel" "Gray"
+        Write-ColorOutput "  LEAVER - wipe and return to stock (keeps Autopilot, group tag '$StockGroupTag')" "Magenta"
+        Write-ColorOutput "  [5] WIPE + return to stock (waits for wipe to complete)" "Red"
+        Write-ColorOutput "  [6] WIPE + return to stock - FAST (does not wait)" "Red"
+        Write-ColorOutput ""
+        Write-ColorOutput "  [7] Cancel" "Gray"
         Write-ColorOutput ""
 
-        $actionChoice = Read-Host "Enter your choice (1-5)"
+        $actionChoice = Read-Host "Enter your choice (1-7)"
 
         switch ($actionChoice) {
             "1" {
@@ -616,13 +615,54 @@
                     return
                 }
             }
-            "5" {
+            { $_ -in "5", "6" } {
+                $actionType = "Leaver"
+                $performWipe = $true
+                if ($actionChoice -eq "6") { $script:NoLoggingMode = $true }
+                $validChoice = $true
+                Write-ColorOutput ""
+                Write-ColorOutput "Mode: LEAVER - wipe and return to stock$(if ($script:NoLoggingMode) { ' - SKIP STATUS CHECKS' })" "Yellow"
+                Write-ColorOutput "  Autopilot: kept, user unassigned, group tag set to '$StockGroupTag'" "Gray"
+                Write-ColorOutput "  Entra ID:  kept for Autopilot devices$(if ($RemoveEntraOwner) { ', registered owner removed' }); removed for device preparation devices" "Gray"
+                Write-ColorOutput "  Intune:    wiped (Intune removes the record when the wipe completes)" "Gray"
+                if (-not $SkipDefenderTag) {
+                    Write-ColorOutput "  Defender:  tagged '$LeaverDefenderTag'" "Gray"
+                }
+                Write-ColorOutput ""
+                Write-ColorOutput "⚠️  WARNING: This will FACTORY RESET the selected device(s)!" "Red"
+                $wipeConfirm = Read-Host "Type 'WIPE' to confirm"
+                if ($wipeConfirm -ne 'WIPE') {
+                    Write-ColorOutput "Wipe cancelled. Exiting." "Yellow"
+                    return
+                }
+            }
+            "7" {
                 Write-ColorOutput "Cancelled." "Yellow"
                 return
             }
             default {
                 Write-ColorOutput "Invalid choice. Please try again." "Red"
             }
+        }
+    }
+
+    # Defender for Endpoint tagging uses a separate API and sign-in
+    $defenderTag = if ($actionType -eq "Leaver") { $LeaverDefenderTag } else { $DisposalDefenderTag }
+    $tagDefender = $false
+    if (-not $SkipDefenderTag) {
+        Write-ColorOutput ""
+        $tagDefender = Connect-DefenderApi
+    }
+
+    # Owner removal needs Directory.AccessAsUser.All on the current Graph session
+    $removeOwner = $false
+    if ($actionType -eq "Leaver" -and $RemoveEntraOwner) {
+        if ((Get-MgContext).Scopes -contains "Directory.AccessAsUser.All") {
+            $removeOwner = $true
+        } else {
+            Write-ColorOutput ""
+            Write-ColorOutput "⚠ -RemoveEntraOwner needs the Directory.AccessAsUser.All permission, which this Graph session doesn't have." "Yellow"
+            Write-ColorOutput "  Owners will be left in place. Run Disconnect-MgGraph, then start the tool again." "Yellow"
         }
     }
 
@@ -634,18 +674,42 @@
         $deviceName = $fullDevice.DisplayName
         $deviceSerial = $fullDevice.SerialNumber
 
+        # StartTime = when the request was sent; Elapsed = time until removal confirmed (standard) or request completed (fast)
         $deviceResult = [PSCustomObject]@{
             SerialNumber = $deviceSerial
             DisplayName = $deviceName
-            EntraID = @{ Found = $false; Success = $false; DeletedCount = 0; FailedCount = 0; Errors = @() }
-            Intune = @{ Found = $false; Success = $false; Error = $null }
-            Autopilot = @{ Found = $false; Success = $false; Error = $null }
+            EntraID = @{ Found = $false; Success = $false; DeletedCount = 0; FailedCount = 0; Errors = @(); StartTime = $null; Elapsed = "N/A"; Status = "Not found" }
+            Intune = @{ Found = $false; Success = $false; Error = $null; StartTime = $null; Elapsed = "N/A"; Status = "Not found" }
+            Autopilot = @{ Found = $false; Success = $false; Error = $null; StartTime = $null; Elapsed = "N/A"; Status = "Not found" }
+            Defender = @{ Found = $false; Success = $false; Error = $null; StartTime = $null; Elapsed = "N/A"; Status = if ($SkipDefenderTag) { "Skipped" } else { "Skipped - not connected" } }
+            Action = $actionType
             Wiped = $false
+            ProcessStart = Get-Date
+            ProcessEnd = $null
         }
 
         Write-ColorOutput ""
         Write-ColorOutput "Processing: $deviceName (Serial: $deviceSerial)" "Cyan"
         Write-ColorOutput "------------------------------" "DarkGray"
+
+        # Tag in Defender first, while the device's Defender record is still current
+        if ($tagDefender) {
+            $deviceResult.Defender.StartTime = Get-Date
+            $defenderResult = Set-DefenderMachineTag -EntraDeviceId $fullDevice.EntraDeviceId -DeviceName $deviceName -Tag $defenderTag
+            $deviceResult.Defender.Found = $defenderResult.Found
+            $deviceResult.Defender.Success = $defenderResult.Success
+            $deviceResult.Defender.Error = $defenderResult.Error
+            $deviceResult.Defender.Elapsed = Format-ElapsedTime $deviceResult.Defender.StartTime
+            $deviceResult.Defender.Status = if ($defenderResult.Error -and -not $defenderResult.Found) { "Failed" } elseif (-not $defenderResult.Found) { "Not found" } elseif ($defenderResult.Success) { "Tagged '$defenderTag' ($($defenderResult.TaggedCount))" } else { "Failed" }
+        }
+
+        # Leaver: wipe and return to stock, then move on to the next device
+        if ($actionType -eq "Leaver") {
+            Invoke-LeaverDevice -FullDevice $fullDevice -DeviceResult $deviceResult -WaitForWipe (-not $script:NoLoggingMode) -StockGroupTag $StockGroupTag -RemoveOwner $removeOwner
+            $deviceResult.ProcessEnd = Get-Date
+            $results += $deviceResult
+            continue
+        }
 
         # WIPE device first if requested
         if ($performWipe -and -not $WhatIfPreference) {
@@ -655,6 +719,7 @@
                 Write-ColorOutput ""
                 Write-ColorOutput "Step 1: Wiping device..." "Yellow"
 
+                $deviceResult.Intune.StartTime = Get-Date
                 $wipeResult = Invoke-IntuneDeviceWipe -ManagedDeviceId $intuneDevice.id
 
                 if ($wipeResult) {
@@ -666,6 +731,8 @@
                         $deviceResult.Wiped = $true
                         $deviceResult.Intune.Success = $true
                         $deviceResult.Intune.Found = $true
+                        $deviceResult.Intune.Elapsed = Format-ElapsedTime $deviceResult.Intune.StartTime
+                        $deviceResult.Intune.Status = "Wipe sent"
                     } else {
                         # Force sync
                         Write-ColorOutput "Sending sync to force check-in..." "Yellow"
@@ -682,16 +749,26 @@
                             $deviceResult.Wiped = $true
                             $deviceResult.Intune.Success = $true
                             $deviceResult.Intune.Found = $true
+                            $deviceResult.Intune.Elapsed = Format-ElapsedTime $deviceResult.Intune.StartTime
+                            $deviceResult.Intune.Status = "Wiped"
                             Write-ColorOutput ""
                             Write-ColorOutput "Step 3: Removing remaining records..." "Yellow"
                         } else {
                             Write-ColorOutput "Wipe did not complete. Skipping record removal for this device." "Red"
+                            $deviceResult.Intune.Found = $true
+                            $deviceResult.Intune.Elapsed = Format-ElapsedTime $deviceResult.Intune.StartTime
+                            $deviceResult.Intune.Status = "Wipe timed out"
+                            $deviceResult.ProcessEnd = Get-Date
                             $results += $deviceResult
                             continue
                         }
                     }
                 } else {
                     Write-ColorOutput "Failed to send wipe command. Skipping this device." "Red"
+                    $deviceResult.Intune.Found = $true
+                    $deviceResult.Intune.Elapsed = Format-ElapsedTime $deviceResult.Intune.StartTime
+                    $deviceResult.Intune.Status = "Wipe failed"
+                    $deviceResult.ProcessEnd = Get-Date
                     $results += $deviceResult
                     continue
                 }
@@ -706,28 +783,42 @@
 
         # Remove from Intune (skip if already removed by wipe)
         if (-not $deviceResult.Wiped) {
+            $deviceResult.Intune.StartTime = Get-Date
             $intuneResult = Remove-IntuneDevice -DeviceName $deviceName -SerialNumber $deviceSerial
             $deviceResult.Intune.Found = $intuneResult.Found
             $deviceResult.Intune.Success = $intuneResult.Success
             $deviceResult.Intune.Error = $intuneResult.Error
+            if ($intuneResult.Found) {
+                $deviceResult.Intune.Elapsed = Format-ElapsedTime $deviceResult.Intune.StartTime
+                $deviceResult.Intune.Status = if ($intuneResult.Success) { "Removal sent" } else { "Failed" }
+            }
         }
 
         # Remove from Autopilot
+        $deviceResult.Autopilot.StartTime = Get-Date
         $autopilotResult = Remove-AutopilotDevice -DeviceName $deviceName -SerialNumber $deviceSerial
         $deviceResult.Autopilot.Found = $autopilotResult.Found
         $deviceResult.Autopilot.Success = $autopilotResult.Success
         $deviceResult.Autopilot.Error = $autopilotResult.Error
+        if ($autopilotResult.Found) {
+            $deviceResult.Autopilot.Elapsed = Format-ElapsedTime $deviceResult.Autopilot.StartTime
+            $deviceResult.Autopilot.Status = if ($autopilotResult.Success) { "Removal sent" } else { "Failed" }
+        }
 
         # Remove from Entra ID
         $entraDeviceId = $fullDevice.EntraDeviceId
         $entraDevices = Get-EntraDeviceByName -DeviceName $deviceName -SerialNumber $deviceSerial -EntraDeviceId $entraDeviceId
         if ($entraDevices -and $entraDevices.Count -gt 0) {
             $deviceResult.EntraID.Found = $true
+            $deviceResult.EntraID.StartTime = Get-Date
             $entraResult = Remove-EntraDevices -Devices $entraDevices -DeviceName $deviceName -SerialNumber $deviceSerial
             $deviceResult.EntraID.Success = $entraResult.Success
             $deviceResult.EntraID.DeletedCount = $entraResult.DeletedCount
             $deviceResult.EntraID.FailedCount = $entraResult.FailedCount
             $deviceResult.EntraID.Errors = $entraResult.Errors
+            # Entra ID deletion is immediate, so the request time is the removal time
+            $deviceResult.EntraID.Elapsed = Format-ElapsedTime $deviceResult.EntraID.StartTime
+            $deviceResult.EntraID.Status = if ($entraResult.Success) { "Removed" } else { "Failed" }
         }
 
         # In No Logging mode, just show processed message and skip monitoring
@@ -788,6 +879,8 @@
                             $intuneRemoved = $true
                             Write-ColorOutput "✓ Device removed from Intune" "Green"
                             $deviceResult.Intune.Verified = $true
+                            $deviceResult.Intune.Elapsed = Format-ElapsedTime $deviceResult.Intune.StartTime
+                            $deviceResult.Intune.Status = "Removed"
                         }
                     }
                     catch {
@@ -804,6 +897,8 @@
                             $autopilotRemoved = $true
                             Write-ColorOutput "✓ Device removed from Autopilot" "Green"
                             $deviceResult.Autopilot.Verified = $true
+                            $deviceResult.Autopilot.Elapsed = Format-ElapsedTime $deviceResult.Autopilot.StartTime
+                            $deviceResult.Autopilot.Status = "Removed"
                         }
                     }
                     catch {
@@ -851,16 +946,27 @@
                 Write-ColorOutput ""
                 Write-ColorOutput "⚠ Monitoring timeout reached after $maxMonitorMinutes minutes" "Red"
                 Write-ColorOutput "Some devices may still be present in the services" "Yellow"
+
+                # Record how long we waited for any removal that never confirmed
+                foreach ($service in @($deviceResult.Intune, $deviceResult.Autopilot)) {
+                    if ($service.Status -eq "Removal sent") {
+                        $service.Elapsed = Format-ElapsedTime $service.StartTime
+                        $service.Status = "Timed out"
+                    }
+                }
             }
         }
 
+        $deviceResult.ProcessEnd = Get-Date
         $results += $deviceResult
     }
 
-    # Export CSV for removals in No Logging mode
-    if ($script:NoLoggingMode -and $results.Count -gt 0) {
+    # Export CSV of processed devices (all modes)
+    if ($results.Count -gt 0) {
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $csvPath = Join-Path -Path (Get-Location) -ChildPath "DeviceRemoval_$timestamp.csv"
+        $csvPrefix = if ($actionType -eq "Leaver") { "DeviceLeaver" } else { "DeviceRemoval" }
+        if ($WhatIfPreference) { $csvPrefix += "_WhatIf" }
+        $csvPath = Join-Path -Path (Get-Location) -ChildPath "$($csvPrefix)_$timestamp.csv"
 
         # Build CSV export data
         $csvData = foreach ($result in $results) {
@@ -879,11 +985,20 @@
                 "Device Display Name" = $result.DisplayName
                 "Serial Number" = $result.SerialNumber
                 "Device ID" = $deviceId
+                "Action" = $result.Action
+                "Mode" = if ($script:NoLoggingMode) { "Fast" } else { "Standard" }
                 "Wipe Sent" = if ($result.Wiped) { "Yes" } else { "No" }
-                "Intune Removal Sent" = if ($result.Intune.Success) { "Yes" } else { "No" }
-                "Autopilot Removal Sent" = if ($result.Autopilot.Success) { "Yes" } else { "No" }
-                "Entra Removal Sent" = if ($result.EntraID.Success) { "Yes" } else { "No" }
-                "Processed Time" = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                "Defender Status" = $result.Defender.Status
+                "Defender Elapsed" = $result.Defender.Elapsed
+                "Intune Status" = $result.Intune.Status
+                "Intune Elapsed" = $result.Intune.Elapsed
+                "Autopilot Status" = $result.Autopilot.Status
+                "Autopilot Elapsed" = $result.Autopilot.Elapsed
+                "Entra Status" = $result.EntraID.Status
+                "Entra Elapsed" = $result.EntraID.Elapsed
+                "Total Elapsed" = Format-ElapsedTime $result.ProcessStart $result.ProcessEnd
+                "Started" = $result.ProcessStart.ToString("yyyy-MM-dd HH:mm:ss")
+                "Completed" = if ($result.ProcessEnd) { $result.ProcessEnd.ToString("yyyy-MM-dd HH:mm:ss") } else { "N/A" }
             }
         }
 

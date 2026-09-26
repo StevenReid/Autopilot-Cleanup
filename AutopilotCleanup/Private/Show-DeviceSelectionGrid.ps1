@@ -9,27 +9,53 @@ function Show-DeviceSelectionGrid {
     Add-Type -AssemblyName PresentationCore
     Add-Type -AssemblyName WindowsBase
 
+    # Convert a date value (DateTime, ISO string or "null") to a DateTime for sorting; missing dates sort first
+    $toSortDate = {
+        param($value)
+        $parsed = [datetime]::MinValue
+        if ($value -is [datetime]) { $value }
+        elseif ($value -and [datetime]::TryParse([string]$value, [ref]$parsed)) { $parsed }
+        else { [datetime]::MinValue }
+    }
+
+    # Display a sort date in local time using the regional short date format, or "null" when there is no date
+    $toDisplayDate = {
+        param([datetime]$date)
+        if ($date -eq [datetime]::MinValue) { return "null" }
+        if ($date.Kind -eq [System.DateTimeKind]::Utc) { $date = $date.ToLocalTime() }
+        $date.ToString("d", [System.Globalization.CultureInfo]::CurrentCulture)
+    }
+
     # Store devices with selection state
     $script:deviceList = [System.Collections.ArrayList]::new()
     foreach ($device in $Devices) {
+        $registeredSort = & $toSortDate $device.EntraRegistered
+        $lastActivitySort = & $toSortDate $device.EntraLastActivity
         $null = $script:deviceList.Add([PSCustomObject]@{
             Selected     = $false
             DisplayName  = $device.DisplayName
             SerialNumber = $device.SerialNumber
             Model        = $device.Model
             GroupTag     = $device.GroupTag
+            AutopilotFound = $device.AutopilotFound
             IntuneFound  = $device.IntuneFound
             EntraFound   = $device.EntraFound
             IntuneName   = $device.IntuneName
             EntraName    = $device.EntraName
-            Original     = $device
+            EntraRegistered   = & $toDisplayDate $registeredSort
+            EntraLastActivity = & $toDisplayDate $lastActivitySort
+            EntraRegisteredSort   = $registeredSort
+            EntraLastActivitySort = $lastActivitySort
+            EntraOwner            = $device.EntraOwner
+            AutopilotAssignedUser = $device.AutopilotAssignedUser
+            Original   = $device
         })
     }
 
     $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="$Title" Height="700" Width="1200" WindowStartupLocation="CenterScreen">
+        Title="$Title" Height="700" Width="1800" WindowStartupLocation="CenterScreen">
     <Grid Margin="10">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -65,10 +91,15 @@ function Show-DeviceSelectionGrid {
                     <GridViewColumn Header="Serial Number" Width="220" DisplayMemberBinding="{Binding SerialNumber}"/>
                     <GridViewColumn Header="Model" Width="120" DisplayMemberBinding="{Binding Model}"/>
                     <GridViewColumn Header="Group Tag" Width="80" DisplayMemberBinding="{Binding GroupTag}"/>
+                    <GridViewColumn Header="Autopilot" Width="70" DisplayMemberBinding="{Binding AutopilotFound}"/>
                     <GridViewColumn Header="Intune" Width="60" DisplayMemberBinding="{Binding IntuneFound}"/>
                     <GridViewColumn Header="Entra" Width="60" DisplayMemberBinding="{Binding EntraFound}"/>
                     <GridViewColumn Header="Intune Name" Width="150" DisplayMemberBinding="{Binding IntuneName}"/>
                     <GridViewColumn Header="Entra Name" Width="150" DisplayMemberBinding="{Binding EntraName}"/>
+                    <GridViewColumn Header="Entra Registered" Width="120" DisplayMemberBinding="{Binding EntraRegistered}"/>
+                    <GridViewColumn Header="Entra Last Activity" Width="120" DisplayMemberBinding="{Binding EntraLastActivity}"/>
+                    <GridViewColumn Header="Entra Owner" Width="200" DisplayMemberBinding="{Binding EntraOwner}"/>
+                    <GridViewColumn Header="Autopilot Assigned User" Width="200" DisplayMemberBinding="{Binding AutopilotAssignedUser}"/>
                 </GridView>
             </ListView.View>
         </ListView>
@@ -156,6 +187,52 @@ function Show-DeviceSelectionGrid {
     $listView.AddHandler(
         [System.Windows.Controls.CheckBox]::UncheckedEvent,
         [System.Windows.RoutedEventHandler]{ & $updateCount }
+    )
+
+    # Sort by clicking column headers - click again to reverse direction
+    $sortKeyMap = @{
+        EntraRegistered   = "EntraRegisteredSort"
+        EntraLastActivity = "EntraLastActivitySort"
+    }
+    $script:sortedHeader = $null
+    $script:sortedHeaderText = $null
+    $script:sortProperty = $null
+    $script:sortDirection = [System.ComponentModel.ListSortDirection]::Ascending
+
+    $listView.AddHandler(
+        [System.Windows.Controls.GridViewColumnHeader]::ClickEvent,
+        [System.Windows.RoutedEventHandler]{
+            param($src, $e)
+            $header = $e.OriginalSource
+            # Ignore the checkbox column and the empty filler header
+            if ($header -isnot [System.Windows.Controls.GridViewColumnHeader] -or -not $header.Column) { return }
+            $binding = $header.Column.DisplayMemberBinding
+            if (-not $binding) { return }
+
+            $property = $binding.Path.Path
+            if ($sortKeyMap.ContainsKey($property)) { $property = $sortKeyMap[$property] }
+
+            if ($script:sortProperty -eq $property) {
+                $script:sortDirection = if ($script:sortDirection -eq [System.ComponentModel.ListSortDirection]::Ascending) {
+                    [System.ComponentModel.ListSortDirection]::Descending
+                } else {
+                    [System.ComponentModel.ListSortDirection]::Ascending
+                }
+            } else {
+                $script:sortDirection = [System.ComponentModel.ListSortDirection]::Ascending
+            }
+            $script:sortProperty = $property
+
+            $script:collectionView.SortDescriptions.Clear()
+            $script:collectionView.SortDescriptions.Add([System.ComponentModel.SortDescription]::new($property, $script:sortDirection))
+
+            # Move the sort arrow to the clicked header
+            if ($script:sortedHeader) { $script:sortedHeader.Column.Header = $script:sortedHeaderText }
+            if ($script:sortedHeader -ne $header) { $script:sortedHeaderText = [string]$header.Column.Header }
+            $arrow = if ($script:sortDirection -eq [System.ComponentModel.ListSortDirection]::Ascending) { [char]0x25B2 } else { [char]0x25BC }
+            $header.Column.Header = "$($script:sortedHeaderText) $arrow"
+            $script:sortedHeader = $header
+        }
     )
 
     $script:dialogResult = $false
