@@ -80,6 +80,8 @@ param(
     [switch]$RemoveEntraOwner
 )
 
+#$whatif = $true  
+
 # Import the module from the adjacent directory
 $modulePath = Join-Path -Path $PSScriptRoot -ChildPath 'AutopilotCleanup'
 Import-Module $modulePath -Force

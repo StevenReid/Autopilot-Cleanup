@@ -68,6 +68,8 @@ function Connect-DefenderApi {
         $listener.Start()
 
         Write-ColorOutput "  Opening browser for Defender sign-in..." "Cyan"
+        Write-ColorOutput "  If the browser doesn't open or sign-in fails, paste this URL into a browser (e.g. an InPrivate window):" "Gray"
+        Write-ColorOutput "  $authUrl" "Gray"
         Start-Process $authUrl
 
         # Wait for the redirect carrying the code (ignore other requests such as favicon)

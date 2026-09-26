@@ -455,16 +455,14 @@
                     }
                 }
             }
-            if (-not $autopilotDevice -and $deviceName) {
-                $uri = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities?`$filter=displayName eq '$deviceName'"
-                $response = Invoke-MgGraphRequest -Uri $uri -Method GET
-                if ($response.value -and $response.value.Count -gt 0) {
-                    $autopilotDevice = $response.value | Select-Object -First 1
-                    Write-ColorOutput "    ✓ Found by device name" "Green"
-                }
-            }
+            # No display name fallback: the Autopilot endpoint doesn't support filtering on
+            # displayName (returns 400 Bad Request), and records are keyed by serial number
             if (-not $autopilotDevice) {
-                Write-ColorOutput "    ✗ Not found" "Yellow"
+                if ($fullDevice.AutopilotFound -eq "No") {
+                    Write-ColorOutput "    ✗ Not registered in Autopilot (Autopilot device preparation / Intune only)" "Yellow"
+                } else {
+                    Write-ColorOutput "    ✗ Not found" "Yellow"
+                }
             }
         }
         catch {
